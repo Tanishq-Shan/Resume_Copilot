@@ -11,6 +11,73 @@ const SKILLS = [
   { key: "frameworks", weight: 3, patterns: ["iso 27001", "nist", "ism", "cis", "framework", "compliance"] }
 ];
 
+// =====================
+// CONFIG / LISTS
+// =====================
+
+// Core stop words used by tokenizer + phrase extractor
+const STOP_WORDS = new Set([
+  "and","or","the","a","an","to","of","in","for","on","with","as","at","by",
+  "is","are","was","were","be","been","being","this","that","it","from",
+  "you","your","we","our","they","their","i","me","my",
+  "will","can","may","should","would","could",
+  "role","team","company","experience","skills","ability",
+  "responsibilities","responsibility","required","requirements",
+  "strong","good","great","excellent","high","level","ensure","ensuring",
+  "including","include","etc","such","other","various","multiple","different",
+  "working","work","worked","perform","performing","conduct","conducting",
+  "manage","managing","managed","provide","providing","provided",
+  "support","supporting","supported","maintain","maintaining","maintained",
+  "develop","developing","developed","implement","implementing","implemented",
+  "identify","identifying","identified","investigate","investigating",
+  "monitor","monitoring","resolve","resolving","analysis","analysing","analyze","analyzing",
+  "improve","improving","improved","deliver","delivering","delivered",
+  "assist","assisting","assisted","lead","leading","led",
+  "across","within","into","over","under","between","through",
+  "location","locations","environment","environments",
+  "professional","clear","confident","customer","focused","focus",
+  "tertiary","qualification","qualifications","degree","years","year",
+  "activities","activity","translate","decisive","pressure","under",
+  "our","new","learning","technologies","supporting","backlog","streamline"
+]);
+
+// Words that usually create ugly sentence fragments in phrases
+const VERBISH = new Set([
+  "reproduce","participate","bring","provide","providing","perform","performing",
+  "conduct","conducting","maintain","maintaining","implement","implementing",
+  "develop","developing","promote","promoting","ensure","ensuring",
+  "identify","identifying","investigate","investigating","monitor","monitoring",
+  "resolve","resolving","troubleshoot","troubleshooting",
+  "analyse","analyze","analysing","debug","debugging","prevent","preventing",
+  "translate","translating","act","acting",
+  "oversee","overseeing","manage","managing","lead","leading"
+]);
+
+// Soft-skill words to block from phrase generation (not from matching)
+const SOFT_KILL = new Set([
+  "leadership","executive","stakeholder","stakeholders","communication",
+  "professional","confident","decisive","pressure","customer","focused"
+]);
+
+// Tech hint words used to decide if a phrase “looks technical”
+const TECH_HINTS = [
+  "api","apis","integration","integrations","endpoint","endpoints",
+  "log","logs","error","errors","alert","alerts","incident","incidents",
+  "ticket","tickets","ticketing","sla","slas",
+  "network","dns","dhcp","tcp","ip","vpn","proxy","firewall",
+  "server","servers","database","databases","storage","backup","recovery",
+  "cloud","aws","azure","gcp","kubernetes","docker","linux","windows",
+  "iam","sso","mfa","siem","soc","splunk","sentinel","qradar","edr","xdr",
+  "vulnerability","vulnerabilities","patch","patching","remediation",
+  "compliance","risk","policy","policies","framework","frameworks","ism","nist","cis",
+  "authentication","authorization","auth","oauth","saml","jwt",
+  "cloudformation","terraform","ansible","jenkins","gitlab","ci/cd",
+  "dynamodb","snowflake","mssql","iis","active_directory","microsoft_365","apm"
+];
+
+// Cert regex (centralized)
+const CERT_REGEX = /\b(CISSP|CCSP|CISM|CISA|CEH|OSCP|GCIH|GCFA|GREM|GCSA|SEC\+|SECURITY\+|CYSA\+|PENTEST\+)\b/gi;
+
 
 document.getElementById("save").addEventListener("click", async () => {
   const resume = resumeEl.value.trim();
@@ -34,7 +101,7 @@ document.getElementById("match").addEventListener("click", async () => {
       func: () => {
         const sel = window.getSelection()?.toString()?.trim() || "";
         // Prefer selection; fallback to whole page
-        return sel.length > 30 ? sel : (document.body.innerText || "");
+        return sel.length > 30 ? sel : "";
       }
     });
 
@@ -47,10 +114,15 @@ document.getElementById("match").addEventListener("click", async () => {
 
     const r = analyzeHybrid(resume, jobText);
     document.getElementById("progressBar").style.width = r.score + "%";
+    const foundBuckets = bucketize(r.found);
+    const missingBuckets = bucketize(r.missing);
+
     outEl.textContent =
       `Match: ${r.score}%\n\n` +
-      `Found: ${r.found.map(prettySkill).join(", ")}\n\n\n` +
-      `Missing: ${r.missing.map(prettySkill).join(", ")}`;
+      `FOUND (by category)\n` +
+      `${formatBuckets(foundBuckets, 4)}\n\n` +
+      `MISSING (by category)\n` +
+      `${formatBuckets(missingBuckets, 4)}`;
 
   } catch (e) {
     outEl.textContent =
@@ -62,9 +134,25 @@ document.getElementById("match").addEventListener("click", async () => {
 
 document.getElementById("clearSel").addEventListener("click", async () => {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-  chrome.tabs.sendMessage(tab.id, { type: "CLEAR_SELECTION" }, () => {
+
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      func: () => {
+        const sel = window.getSelection?.();
+        if (sel) sel.removeAllRanges();
+        return true;
+      }
+    });
+
+    // also clear UI so you don't see the old match
     outEl.textContent = "Selection cleared ✅";
-  });
+    const bar = document.getElementById("progressBar");
+    if (bar) bar.style.width = "0%";
+
+  } catch (e) {
+    outEl.textContent = "Couldn't clear selection. Refresh the page and try again.";
+  }
 });
 
 document.getElementById("how").addEventListener("click", () => {
@@ -138,8 +226,9 @@ function analyzeKeywordFallback(resume, jobText) {
 function extractCandidateSkills(text) {
   const raw = text || "";
   // Certifications & common cyber quals (keep even if mentioned once)
-  const certs = (raw.match(/\b(CISSP|CCSP|CISM|CISA|CEH|OSCP|GCIH|GCFA|GREM|GCSA|SEC\+|SECURITY\+|CYSA\+|PENTEST\+)\b/gi) || [])
-    .map(c => c.toLowerCase().replace("security+", "sec+"));
+  const certs = (raw.match(CERT_REGEX) || [])
+  .map(c => c.toLowerCase().replace("security+", "sec+"));
+  const must = extractMustHaveTech(raw);
 
 
   // 1) Acronyms like SIEM, SOC, IAM, API, VPN, SSO (2-10 chars)
@@ -155,66 +244,18 @@ function extractCandidateSkills(text) {
 
   const words = cleaned.split(" ").filter(Boolean);
 
-  // Generic junk words
-  const bad = new Set([
-    "and","or","the","a","an","to","of","in","for","on","with","as","at","by",
-    "is","are","was","were","be","been","being","this","that","it","from",
-    "will","can","may","should","would","could",
-    "role","team","company","work","experience","skills","ability",
-    "responsibilities","responsibility","required","requirements",
-    "strong","good","great","excellent","high","level","ensure","ensuring",
-    "including","include","etc","such","other","across","different","multiple","various",
-    "location","locations","environment","environments",
-    "professional","clear","confident","customer","focused","focus",
-    "tertiary","qualification","qualifications","degree","years","year",
-    "activities","activity","translate","decisive","pressure","under"
-
-  ]);
-
-  // Verb-ish words that create ugly phrases
-  const verbish = new Set([
-    "reproduce","participate","bring","working","work","provide","providing",
-    "perform","performing","conduct","conducting","maintain","maintaining",
-    "implement","implementing","develop","developing","promote","promoting",
-    "ensure","ensuring","identify","identifying","investigate","investigating",
-    "monitor","monitoring","resolve","resolving","troubleshoot","troubleshooting",
-    "analyse","analyze","analysing","debug","debugging","prevent","preventing",
-    "translate","translating","act","acting"
-
-  ]);
-
-  // Words/terms that indicate "this is probably technical"
-  const techHints = [
-    "api","apis","integration","integrations","endpoint","endpoints",
-    "log","logs","error","errors","alert","alerts","incident","incidents",
-    "ticket","tickets","ticketing","sla","slas",
-    "network","dns","dhcp","tcp","ip","vpn","proxy","firewall",
-    "server","servers","database","databases","storage","backup","recovery",
-    "cloud","aws","azure","gcp","kubernetes","docker","linux","windows",
-    "iam","sso","mfa","siem","soc","splunk","sentinel","qradar","edr","xdr",
-    "vulnerability","vulnerabilities","patch","patching","remediation",
-    "compliance","risk","policy","policies","framework","frameworks","ism","nist","cis",
-    "authentication","authorization","auth","oauth","saml","jwt"
-  ];
-
-  const softKill = new Set([
-  "leadership","executive","stakeholder","stakeholders","communication",
-  "professional","confident","decisive","pressure","customer","focused"
-  ]);
-
-
   function hasTechHint(phrase) {
     const p = phrase.toLowerCase();
-    return techHints.some(h => p.includes(h));
+    return TECH_HINTS.some(h => p.includes(h));
   }
 
   // 3) Singles (1-word terms): keep tech-looking ones
   const singles = [];
   for (const w of words) {
     if (w.length < 3) continue;
-    if (bad.has(w)) continue;
+    if (STOP_WORDS.has(w)) continue;
     // keep if it's likely technical (hint match) OR acronym-like in lowercase
-    if (techHints.includes(w) || hasTechHint(w)) singles.push(w);
+    if (TECH_HINTS.includes(w) || hasTechHint(w)) singles.push(w);
   }
 
   // 4) Bigrams + Trigrams
@@ -224,18 +265,17 @@ function extractCandidateSkills(text) {
     const w2 = words[i + 1];
     const w3 = words[i + 2];
 
-    if (!w1 || bad.has(w1) || verbish.has(w1)) continue;
+    if (!w1 || STOP_WORDS.has(w1) || VERBISH.has(w1)) continue;
 
     // bigram
-    if (w2 && !bad.has(w2) && !verbish.has(w2)) {
-      if (softKill.has(w1) || softKill.has(w2)) continue;
+    if (w2 && !STOP_WORDS.has(w2) && !VERBISH.has(w2)) {
+      if (SOFT_KILL.has(w1) || SOFT_KILL.has(w2)) continue;
       const bi = `${w1} ${w2}`;
       if (hasTechHint(bi)) phrases.push(bi);
     }
-
     // trigram: only if it looks techy AND no verbish word inside
-    if (w2 && w3 && !bad.has(w2) && !bad.has(w3) && !verbish.has(w2) && !verbish.has(w3)) {
-      if (softKill.has(w1) || softKill.has(w2) || softKill.has(w3)) continue;
+    if (w2 && w3 && !STOP_WORDS.has(w2) && !STOP_WORDS.has(w3) && !VERBISH.has(w2) && !VERBISH.has(w3)) {
+      if (SOFT_KILL.has(w1) || SOFT_KILL.has(w2) || SOFT_KILL.has(w3)) continue;
       const tri = `${w1} ${w2} ${w3}`;
       if (hasTechHint(tri)) phrases.push(tri);
     }
@@ -243,7 +283,7 @@ function extractCandidateSkills(text) {
 
   // 5) Frequency ranking (repeated phrases matter more)
   const freq = new Map();
-  for (const t of [...acronyms, ...certs, ...singles, ...phrases]) {
+  for (const t of [...must, ...acronyms, ...certs, ...singles, ...phrases]) {
     if (!t) continue;
 
     if (t.includes(" ")) {
@@ -266,7 +306,7 @@ function extractCandidateSkills(text) {
       const isSingle = !t.includes(" ");
       if (acronyms.includes(t)) return true;
       if (isPhrase) return c >= 2 || hasTechHint(t);
-      if (isSingle) return c >= 2 || techHints.includes(t);
+      if (isSingle) return c >= 2 || TECH_HINTS.includes(t);
       return false;
     })
     .sort((a, b) => (b[1] - a[1]) || (b[0].length - a[0].length))
@@ -360,11 +400,138 @@ function extractSkills(text) {
   return found;
 }
 
+const BUCKETS = [
+  { name: "Cloud", keys: ["aws","azure","gcp","ec2","vpc","s3","lambda","cloudwatch","cloud","iaas","paas","saas"] },
+  { name: "DevOps / IaC", keys: ["terraform","ansible","cloudformation","ci/cd","gitlab","jenkins","github actions",
+    "pipeline","automation","infrastructure as code","iac","docker","kubernetes","helm","argocd"] },
+  { name: "OS / Identity", keys: ["windows server","linux","unix","iis","active directory","active_directory","entra",
+    "azure ad","okta","powershell","shell","bash","python","sso","mfa","iam","group policy","gpo"] },
+  { name: "Databases", keys: ["mssql","sql server","mysql","postgresql","mongodb","dynamodb","snowflake","oracle","mariadb","database"] },
+  { name: "Networking", keys: ["tcp/ip","tcp","ip","dns","dhcp","vpn","proxy","firewall","routing","switching","wan","lan",
+    "nat","bgp","ospf","subnetting","load balancer"] },
+  { name: "Monitoring", keys: ["monitoring","logging","logs","apm","prometheus","grafana","datadog","new relic","elastic","elk"] },
+  { name: "Security", keys: ["siem","soc","edr","xdr","incident response","vulnerability","vulnerabilities","vuln","patch","patching",
+    "remediation","risk","compliance","nist","cis","iso 27001","framework","ism","threat"] },
+  { name: "Certs", keys: ["cissp","ccsp","cism","cisa","ceh","oscp","gcih","gcfa","grem","gcsa","sec+","security+","cysa+","pentest+","ccna","ccnp"] }
+];
+
+function bucketOf(skill) {
+  const s = (skill || "").toLowerCase();
+  for (const b of BUCKETS) {
+    for (const k of b.keys) {
+      if (s === k) return b.name;
+      if (s.includes(k)) return b.name;
+    }
+  }
+  return "Other";
+}
+
+function bucketize(list) {
+  const out = {};
+  for (const b of BUCKETS) out[b.name] = [];
+  out["Other"] = [];
+
+  for (const item of list) {
+    const b = bucketOf(item);
+    out[b].push(item);
+  }
+
+  // de-dupe inside each bucket
+  for (const k of Object.keys(out)) {
+    out[k] = [...new Set(out[k])];
+  }
+  return out;
+}
+
+function formatBuckets(bucketMap, maxPerBucket = 4) {
+  const lines = [];
+  for (const b of BUCKETS.map(x => x.name).concat(["Other"])) {
+    const items = bucketMap[b] || [];
+    if (!items.length) continue;
+    lines.push(`${b}: ${items.slice(0, maxPerBucket).map(prettySkill).join(", ")}`);
+  }
+  return lines.join("\n");
+}
+
 function prettySkill(s) {
+  if (!s) return "";
+  const map = {
+    "aws": "AWS",
+    "gcp": "GCP",
+    "ci/cd": "CI/CD",
+    "mssql": "SQL Server",
+    "iis": "IIS",
+    "tcp/ip": "TCP/IP",
+    "apm": "APM",
+    "active_directory": "Active Directory",
+    "microsoft_365": "Microsoft 365",
+    "cloudformation": "CloudFormation"
+  };
+
+  const lower = s.toLowerCase();
+  if (map[lower]) return map[lower];
+
   return s
     .replace(/_/g, " ")
     .toLowerCase()
     .replace(/\b\w/g, c => c.toUpperCase());
+}
+
+function extractMustHaveTech(text) {
+  const t = (text || "").toLowerCase();
+
+  const patterns = [
+    // IaC / automation
+    { key: "terraform", re: /\bterraform\b/ },
+    { key: "ansible", re: /\bansible\b/ },
+    { key: "cloudformation", re: /\bcloudformation\b|\bcloud\s*formation\b/ },
+
+    // CI/CD
+    { key: "ci/cd", re: /\bci\/cd\b|\bcicd\b/ },
+    { key: "gitlab", re: /\bgitlab\b/ },
+    { key: "jenkins", re: /\bjenkins\b/ },
+
+    // Scripting
+    { key: "python", re: /\bpython\b/ },
+    { key: "shell", re: /\bshell\b/ },
+    { key: "powershell", re: /\bpowershell\b/ },
+
+    // OS / platforms
+    { key: "linux", re: /\blinux\b|\bunix\b/ },
+    { key: "windows server", re: /\bwindows\s+server\b/ },
+    { key: "iis", re: /\biis\b|\binternet\s+information\s+services\b/ },
+    { key: "active directory", re: /\bactive\s+directory\b|\bad\b/ },
+
+    // AWS core services
+    { key: "aws", re: /\baws\b|\bamazon\s+web\s+services\b/ },
+    { key: "ec2", re: /\bec2\b/ },
+    { key: "vpc", re: /\bvpc\b/ },
+    { key: "s3", re: /\bs3\b/ },
+
+    // GCP
+    { key: "gcp", re: /\bgcp\b|\bgoogle\s+cloud\b/ },
+
+    // Databases
+    { key: "mssql", re: /\bmicrosoft\s+sql\s+server\b|\bsql\s+server\b|\bmssql\b/ },
+    { key: "dynamodb", re: /\bdynamodb\b/ },
+    { key: "snowflake", re: /\bsnowflake\b/ },
+
+    // Networking
+    { key: "tcp/ip", re: /\btcp\/ip\b|\btcp\b/ },
+    { key: "firewall", re: /\bfirewall\b/ },
+    { key: "dns", re: /\bdns\b/ },
+
+    // Monitoring / APM
+    { key: "apm", re: /\bapm\b|\bapplication\s+performance\s+monitoring\b/ },
+    { key: "monitoring", re: /\bmonitoring\b/ },
+    { key: "logging", re: /\blogging\b|\blogs\b/ }
+  ];
+
+  const out = [];
+  for (const p of patterns) {
+    if (p.re.test(t)) out.push(p.key);
+  }
+  return out;
 }
 
 
@@ -400,20 +567,14 @@ function tokenize(text) {
     .replace(/disaster recovery/gi, "disaster_recovery")
     .replace(/data recovery/gi, "data_recovery")
     .replace(/standard operating procedures/gi, "sop")
-    .replace(/operating procedures/gi, "operating_procedures");
+    .replace(/operating procedures/gi, "operating_procedures")
+    .replace(/\bcicd\b/gi, "ci/cd")
+    .replace(/cloud formation/gi, "cloudformation")
+    .replace(/microsoft sql server/gi, "mssql")
+    .replace(/\bsql server\b/gi, "mssql")
+    .replace(/\bpowershell\b/gi, "power_shell");
 
-  const stop = new Set([
-    "and","or","the","a","an","to","of","in","for","on","with","as","at","by",
-    "is","are","was","were","be","been","being","this","that","it","from",
-    "you","your","we","our","they","their","i","me","my",
-    "will","can","may","should","would","could",
-    "job","role","work","team","company","experience","skills","ability",
-    "etc","line","first","second","third","provide","responsibilities",
-    "key","devices","device","phones","phone","laptops","laptop",
-    "desktops","desktop","peripheral","printers","printer","support",
-    "perform","conduct","maintain","maintaining","aligned","activities","advise",
-    "all","such","service","process","processes","documentation","operational"
-  ]);
+  const stop = STOP_WORDS;
 
   return text
     .toLowerCase()
