@@ -38,7 +38,7 @@ const STOP_WORDS = new Set([
   "professional","clear","confident","customer","focused","focus",
   "tertiary","qualification","qualifications","degree","years","year",
   "activities","activity","translate","decisive","pressure","under",
-  "our","new","learning","technologies","supporting","backlog","streamline"
+  "our","new","learning","technologies","supporting","backlog","streamline","design","decisions","decision","logs", "pipeline","cd"
 ]);
 
 // Words that usually create ugly sentence fragments in phrases
@@ -273,12 +273,12 @@ function extractCandidateSkills(text) {
       const bi = `${w1} ${w2}`;
       if (hasTechHint(bi)) phrases.push(bi);
     }
-    // trigram: only if it looks techy AND no verbish word inside
-    if (w2 && w3 && !STOP_WORDS.has(w2) && !STOP_WORDS.has(w3) && !VERBISH.has(w2) && !VERBISH.has(w3)) {
-      if (SOFT_KILL.has(w1) || SOFT_KILL.has(w2) || SOFT_KILL.has(w3)) continue;
-      const tri = `${w1} ${w2} ${w3}`;
-      if (hasTechHint(tri)) phrases.push(tri);
-    }
+//    // trigram: only if it looks techy AND no verbish word inside
+//    if (w2 && w3 && !STOP_WORDS.has(w2) && !STOP_WORDS.has(w3) && !VERBISH.has(w2) && !VERBISH.has(w3)) {
+//     if (SOFT_KILL.has(w1) || SOFT_KILL.has(w2) || SOFT_KILL.has(w3)) continue;
+//      const tri = `${w1} ${w2} ${w3}`;
+//      if (hasTechHint(tri)) phrases.push(tri);
+//    }
   }
 
   // 5) Frequency ranking (repeated phrases matter more)
@@ -317,18 +317,37 @@ function extractCandidateSkills(text) {
 
   const unique = [];
   for (const skill of capped) {
-    const containedInOther = capped.some(other => other !== skill && other.includes(skill));
+    const containedInOther = capped.some(
+      other => other !== skill && other.includes(skill)
+    );
     if (!containedInOther) unique.push(skill);
   }
 
-  return unique.slice(0, 40);
+  const cleanedUnique = unique.filter(s => {
+    const parts = s.split(" ");
+
+    // remove single-letter junk (like "g")
+    if (parts.some(p => p.length === 1)) return false;
+
+    // remove phrases starting with filler verbs
+    const first = parts[0];
+    if (VERBISH.has(first)) return false;
+
+    return true;
+  });
+
+  return cleanedUnique.slice(0, 40);
 }
 
 
 
 function analyzeHybrid(resume, jobText) {
   const resumeLower = (resume || "").toLowerCase();
-  const jobSkills = extractCandidateSkills(jobText);
+  let jobSkills = extractCandidateSkills(jobText);
+
+  // remove phrases that include must-have tools (keep tools only)
+  const must = extractMustHaveTech(jobText);
+  jobSkills = collapseToMustHave(jobSkills, must);
 
   if (jobSkills.length === 0) {
     return { score: 0, found: [], missing: [] };
@@ -411,7 +430,7 @@ const BUCKETS = [
     "nat","bgp","ospf","subnetting","load balancer"] },
   { name: "Monitoring", keys: ["monitoring","logging","logs","apm","prometheus","grafana","datadog","new relic","elastic","elk"] },
   { name: "Security", keys: ["siem","soc","edr","xdr","incident response","vulnerability","vulnerabilities","vuln","patch","patching",
-    "remediation","risk","compliance","nist","cis","iso 27001","framework","ism","threat"] },
+    "remediation","risk","compliance","nist","cis","iso 27001","framework","ism","threat", "incident management", "incident"] },
   { name: "Certs", keys: ["cissp","ccsp","cism","cisa","ceh","oscp","gcih","gcfa","grem","gcsa","sec+","security+","cysa+","pentest+","ccna","ccnp"] }
 ];
 
@@ -443,6 +462,24 @@ function bucketize(list) {
   return out;
 }
 
+function collapseToMustHave(skillList, mustList) {
+  const mustSet = new Set(mustList.map(x => x.toLowerCase()));
+  const out = [];
+
+  for (const s of skillList) {
+    const sl = s.toLowerCase();
+
+    // if phrase contains any must-have tool, skip the phrase
+    // (the tool itself is already in the list)
+    if (sl.includes(" ") && [...mustSet].some(m => sl.includes(m))) {
+      continue;
+    }
+    out.push(s);
+  }
+
+  return out;
+}
+
 function formatBuckets(bucketMap, maxPerBucket = 4) {
   const lines = [];
   for (const b of BUCKETS.map(x => x.name).concat(["Other"])) {
@@ -458,6 +495,8 @@ function prettySkill(s) {
   const map = {
     "aws": "AWS",
     "gcp": "GCP",
+    "vpc": "VPC",
+    "ec2": "EC2",
     "ci/cd": "CI/CD",
     "mssql": "SQL Server",
     "iis": "IIS",
@@ -465,7 +504,12 @@ function prettySkill(s) {
     "apm": "APM",
     "active_directory": "Active Directory",
     "microsoft_365": "Microsoft 365",
-    "cloudformation": "CloudFormation"
+    "cloudformation": "CloudFormation",
+    "vpn": "VPN",
+    "iam": "IAM",
+    "cloudwatch": "CloudWatch",
+    "datadog": "Datadog",
+    "metrics": "Metrics"
   };
 
   const lower = s.toLowerCase();
@@ -487,7 +531,7 @@ function extractMustHaveTech(text) {
     { key: "cloudformation", re: /\bcloudformation\b|\bcloud\s*formation\b/ },
 
     // CI/CD
-    { key: "ci/cd", re: /\bci\/cd\b|\bcicd\b/ },
+    { key: "ci/cd", re: /\bci\/cd\b|\bcicd\b|\bcontinuous\s+integration\b|\bcontinuous\s+delivery\b|\bcd\b/ },
     { key: "gitlab", re: /\bgitlab\b/ },
     { key: "jenkins", re: /\bjenkins\b/ },
 
@@ -507,6 +551,8 @@ function extractMustHaveTech(text) {
     { key: "ec2", re: /\bec2\b/ },
     { key: "vpc", re: /\bvpc\b/ },
     { key: "s3", re: /\bs3\b/ },
+    { key: "cloudwatch", re: /\bcloudwatch\b/ },
+    { key: "datadog", re: /\bdatadog\b/ },
 
     // GCP
     { key: "gcp", re: /\bgcp\b|\bgoogle\s+cloud\b/ },
@@ -520,11 +566,15 @@ function extractMustHaveTech(text) {
     { key: "tcp/ip", re: /\btcp\/ip\b|\btcp\b/ },
     { key: "firewall", re: /\bfirewall\b/ },
     { key: "dns", re: /\bdns\b/ },
+    { key: "vpn", re: /\bvpns?\b/ },
+    { key: "encryption", re: /\bencryption\b|\bencrypt(ed|ing)?\b/ },
+    { key: "iam", re: /\biam\b|\bidentity\s+and\s+access\s+management\b/ },
 
     // Monitoring / APM
     { key: "apm", re: /\bapm\b|\bapplication\s+performance\s+monitoring\b/ },
     { key: "monitoring", re: /\bmonitoring\b/ },
-    { key: "logging", re: /\blogging\b|\blogs\b/ }
+    { key: "logging", re: /\blogging\b|\blogs\b/ },
+    { key: "metrics", re: /\bmetrics\b/ },
   ];
 
   const out = [];
