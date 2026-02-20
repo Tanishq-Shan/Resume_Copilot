@@ -46,6 +46,7 @@ document.getElementById("match").addEventListener("click", async () => {
     }
 
     const r = analyzeHybrid(resume, jobText);
+    document.getElementById("progressBar").style.width = r.score + "%";
     outEl.textContent =
       `Match: ${r.score}%\n\n` +
       `Found: ${r.found.map(prettySkill).join(", ")}\n\n\n` +
